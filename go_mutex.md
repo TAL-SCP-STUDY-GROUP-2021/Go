@@ -112,8 +112,7 @@ func (m *Mutex) Lock() {
 
 1.   判断当前 goroutine 能否进入自旋；
 2.   自旋等待
-3.   todo
-4.   todo
+3.   更新 Mutex 的状态
 
 ### 自旋准入
 
@@ -318,6 +317,103 @@ CAS 操作返回 0 表明当前 goroutine 所掌握的 Mutex 状态与其最新�
 }
 ```
 
-### 总结
+### 小结
 
 1.   当 `break` 出现时才表明 goroutine 获取锁成功，能够退出 `Lock` 的 for 循环；
+
+## 解锁
+
+Mutex 的解锁动作是依靠 `sync.Mutex.Unlock` 方法完成的，解锁流程与加锁类似，同样分为 fast path 和 slow path。
+
+Mutex 的解锁有两点需要注意：
+
+1.   对未加锁的 Mutex 使用 `Unlock` 方法会报 runtime error；
+2.   锁定的 Mutex 并不是某一 goroutine 特有的，一个 goroutine 加锁、另一个 goroutine 解锁是被允许的。
+
+### fast path
+
+在 fast path中，`Unlock` 尝试通过 `AddInt32` 原子操作对 Mutex 的 `mutexLocked` 状态位清零，该操作的返回值是 Mutex 状态位的新值。
+
+如果返回值是 0，则 Mutex 的三个状态位都为零值且等待队列为空，表明当前 goroutine 解锁成功；如果不是 0，则需要进入 `slowUnlock` 流程。
+
+```go
+// Unlock unlocks m.
+// It is a run-time error if m is not locked on entry to Unlock.
+//
+// A locked Mutex is not associated with a particular goroutine.
+// It is allowed for one goroutine to lock a Mutex and then
+// arrange for another goroutine to unlock it.
+func (m *Mutex) Unlock() {
+	if race.Enabled {
+		_ = m.state
+		race.Release(unsafe.Pointer(m))
+	}
+
+	// Fast path: drop lock bit.
+	new := atomic.AddInt32(&m.state, -mutexLocked)
+	if new != 0 {
+		// Outlined slow path to allow inlining the fast path.
+		// To hide unlockSlow during tracing we skip one extra frame when tracing GoUnblock.
+		m.unlockSlow(new)
+	}
+}
+```
+
+### slow path
+
+在进入 `slowUnlock` 方法后，首先要对 Mutex 的状态的合法性进行校验，如果它的 `mutexLocked` 状态位是零值则表明它未锁定，所以 `Unlock` 动作是非法的，runtime 对其进行报错并终止当前进程。
+
+```go
+func (m *Mutex) unlockSlow(new int32) {
+	if (new+mutexLocked)&mutexLocked == 0 {
+		throw("sync: unlock of unlocked mutex")
+	}
+```
+
+如果通过校验，则需要根据 Mutex 的模式（正常/饥饿）选择对应的解锁流程。
+
+```go
+if new&mutexStarving == 0 {
+		old := new
+		for {
+			// If there are no waiters or a goroutine has already
+			// been woken or grabbed the lock, no need to wake anyone.
+			// In starvation mode ownership is directly handed off from unlocking
+			// goroutine to the next waiter. We are not part of this chain,
+			// since we did not observe mutexStarving when we unlocked the mutex above.
+			// So get off the way.
+			if old>>mutexWaiterShift == 0 || old&(mutexLocked|mutexWoken|mutexStarving) != 0 {
+				return
+			}
+			// Grab the right to wake someone.
+			new = (old - 1<<mutexWaiterShift) | mutexWoken
+			if atomic.CompareAndSwapInt32(&m.state, old, new) {
+				runtime_Semrelease(&m.sema, false, 1)
+				return
+			}
+			old = m.state
+		}
+	} else {
+		// Starving mode: handoff mutex ownership to the next waiter, and yield
+		// our time slice so that the next waiter can start to run immediately.
+		// Note: mutexLocked is not set, the waiter will set it after wakeup.
+		// But mutex is still considered locked if mutexStarving is set,
+		// so new coming goroutines won't acquire it.
+		runtime_Semrelease(&m.sema, true, 1)
+	}
+}
+```
+
+#### 正常模式
+
+正常模式的解锁流程是一个无终止条件的 for 循环：
+
+-   如果等待队列为空或者一个 goroutine 已经被唤起或者获取了锁（ `mutexLocked`、`mutexStarving`、`mutexWoken` 状态不同时为 0），则当前 goroutine 已经完成解锁操作，不需要再唤起其他 goroutine，直接返回；
+-   如果上述两个条件都不满足，那么当前 goroutine 要从等待队列中唤起一个等待者，为此，前者需要将队列长度减去 1 并将 Mutex 的 `mutexWoken` 置 1；
+-   接着，当前 goroutine 尝试通过 CAS 操作将 Mutex 修改为最新状态：
+    -   如果修改成功，调用 `sync_runtime_Semrelease` 函数归还 Mutex 的信号量并通知一个正在等待该资源的 goroutine；
+    -   如果修改失败，读取 Mutex 的最新状态后重新进入循环。
+
+#### 饥饿模式
+
+饥饿模式下，当前 goroutine 将 Mutex 的所有权直接移交给队列中的第一个等待者，并让出时间片，以便下一个等待者可以立即开始运行。饥饿模式的解锁过程中没有解除 Mutex 的饥饿状态，这是为了保证 Mutex 不会被新创建的 goroutine 获取从而维护公平性。至于 `mutexLocked` 状态位的重写和对 `mutexStarving` 的处理，它们由接收 Mutex 的 goroutine 来负责。
